@@ -32,6 +32,14 @@ check('incomplete, invited and suspended accounts cannot access private areas', 
   assert.equal(access.canAccessPath('PROFESSIONAL', 'SUSPENDED', '/profissional'), false);
 });
 
+check('account area navigation is hidden for public and inactive accounts and scoped by active role', () => {
+  assert.equal(access.canShowAccountArea(null, null, 'HOTEL'), false);
+  assert.equal(access.canShowAccountArea('HOTEL', 'INVITED', 'HOTEL'), false);
+  assert.equal(access.canShowAccountArea('HOTEL', 'ACTIVE', 'HOTEL'), true);
+  assert.equal(access.canShowAccountArea('HOTEL', 'ACTIVE', 'PROFESSIONAL'), false);
+  assert.equal(access.canShowAccountArea('PROFESSIONAL', 'ACTIVE', 'PROFESSIONAL'), true);
+});
+
 check('administrator area is available only to active ADMIN accounts', () => {
   assert.equal(access.accountHome('ADMIN'), '/admin');
   assert.equal(access.canAccessPath('ADMIN', 'ACTIVE', '/admin'), true);
