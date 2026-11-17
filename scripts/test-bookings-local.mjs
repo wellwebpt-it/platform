@@ -103,13 +103,28 @@ try {
   hotelB = await signup('hotel', 'Fixture Hotel B', fixtureHotelMeta('Fixture Hotel B', 2));
   unapprovedHotel = await signup('hotel', 'Fixture Hotel C', fixtureHotelMeta('Fixture Hotel C', 3));
   pro = await signup('professional', 'Fixture Pro A', { wellweb_signup: 'true', account_type: 'PROFESSIONAL', phone_e164: '+351910000004', city: 'Ericeira', service_area: 'Yoga' });
-  otherPro = await signup('professional', 'Fixture Pro B', { wellweb_signup: 'true', account_type: 'PROFESSIONAL', phone_e164: '+351910000005', city: 'Ericeira', service_area: 'Surf' });
+  otherPro = await signup('professional', 'Fixture Pro B', { wellweb_signup: 'true', account_type: 'PROFESSIONAL', phone_e164: '+351910000005', city: 'Ericeira', service_area: 'Surf', whatsapp_operational_consent: true, whatsapp_consent_text_version: 'wellweb-whatsapp-operations-v1-2026-11-15' });
 
   const [hotelAUser, hotelBUser, unapprovedHotelUser, proUser, otherProUser] = await Promise.all([
     appUserId(hotelA.supabase, hotelA.user.id), appUserId(hotelB.supabase, hotelB.user.id),
     appUserId(unapprovedHotel.supabase, unapprovedHotel.user.id), appUserId(pro.supabase, pro.user.id), appUserId(otherPro.supabase, otherPro.user.id),
   ]);
   professionalPartnerId = proUser;
+  const initialWhatsApp = await pro.supabase.rpc('my_professional_whatsapp_preference');
+  assert.equal(initialWhatsApp.error,null); assert.equal(initialWhatsApp.data?.whatsapp_enabled,false,'existing/new user without explicit consent stays opted out');
+  const deniedConsent = await pro.supabase.rpc('my_save_professional_whatsapp_preference',{p_enabled:true,p_explicit_consent:false,p_text_version:null});
+  assert.ok(deniedConsent.error,'WhatsApp activation must require explicit current consent');
+  const consentVersion='wellweb-whatsapp-operations-v1-2026-11-15';
+  const grantedConsent = await pro.supabase.rpc('my_save_professional_whatsapp_preference',{p_enabled:true,p_explicit_consent:true,p_text_version:consentVersion});
+  assert.equal(grantedConsent.error,null); assert.equal(grantedConsent.data?.whatsapp_enabled,true);
+  await ok(pro.supabase,'my_save_professional_whatsapp_preference',{p_enabled:false,p_explicit_consent:false,p_text_version:null});
+  pass('WhatsApp preference defaults off and explicit versioned opt-in/revocation are enforced');
+  await ok(pro.supabase,'my_save_professional_whatsapp_preference',{p_enabled:true,p_explicit_consent:true,p_text_version:consentVersion});
+  await ok(pro.supabase,'my_update_contact_details',{p_display_name:'Fixture Pro A',p_phone:'+351 910 000 006'});
+  const afterPhoneChange=await pro.supabase.rpc('my_professional_whatsapp_preference');
+  assert.equal(afterPhoneChange.data?.whatsapp_enabled,false,'changing number must require fresh consent');
+  await ok(pro.supabase,'my_update_contact_details',{p_display_name:'Fixture Pro A',p_phone:'+351910000004'});
+  pass('changing the phone disables WhatsApp consent without transferring it to the new number');
   const [membershipA, membershipB, membershipC, profileResult, otherProfileResult] = await Promise.all([
     hotelA.supabase.from('hotel_members').select('hotel_id').eq('user_id', hotelAUser).single(),
     hotelB.supabase.from('hotel_members').select('hotel_id').eq('user_id', hotelBUser).single(),
@@ -126,6 +141,9 @@ try {
   assert.equal(unpublishedIntent.data?.length,0,'publication intent must not bypass pending approval');
   pass('a professional with publication intent remains absent from the public directory until approved');
   const otherProfileId = otherProfileResult.data.id;
+  const registrationConsent=localSql(`select p.whatsapp_enabled::text||':'||count(e.id)::text from wellweb_private.professional_notification_preferences p left join wellweb_private.professional_whatsapp_consent_events e on e.professional_profile_id=p.professional_profile_id where p.professional_profile_id='${otherProfileId}'::uuid group by p.whatsapp_enabled`);
+  assert.match(registrationConsent,/true:1/,'registration opt-in must create one versioned event and enable only that profile');
+  pass('registration opt-in is recorded with a consent event; opt-out stays off by default');
   hotelIds.push(...hotels); profileIds.push(profileId, otherProfileId);
 
   for (const partnerId of [hotelAUser, hotelBUser]) await ok(admin.supabase, 'admin_review_partner', { p_partner_id: partnerId, p_approve: true, p_note: 'Build 5.1 local integration fixture' });
@@ -229,6 +247,8 @@ try {
   const hotelOutbox = await unapprovedHotel.supabase.from('partner_rejection_email_outbox').select('id');
   assert.ok(hotelOutbox.error, 'non-admin users must not read the email outbox');
   pass('admin rejection reason is persisted; ordinary hotel session cannot read private outbox');
+  if(process.env.WELLWEB_SKIP_REJECTION_EMAIL_TEST==='1') pass('existing partner-rejection SMTP check skipped by explicit local integration option');
+  else {
   const emailSend = await admin.supabase.functions.invoke('send-partner-rejection', { body: { outbox_id: outboxId } });
   if (emailSend.error || emailSend.data?.status !== 'SENT') throw new Error(`The local rejection email was not accepted by the local SMTP transport (HTTP ${emailSend.response?.status??'no response'}, code ${emailSend.error?.code??'none'}, state ${emailSend.data?.status??'none'}, result ${emailSend.data?.message??'none'}).`);
   let delivered=false;
@@ -242,6 +262,7 @@ try {
   const sentState = await ok(admin.supabase, 'admin_list_partner_rejection_email', { p_outbox_id: outboxId });
   assert.equal(sentState.status, 'SENT');
   pass('rejection email is delivered only to local Inbucket and its outbox state is SENT');
+  }
 
   await ok(pro.supabase, 'save_wellweb_professional_service', {
     p_service_id: serviceId, p_name: 'Fixture Yoga Published', p_description: 'Snapshot test', p_modality_slug: null,
@@ -321,9 +342,35 @@ try {
   const second = await request(hotelB.supabase, hotels[1]);
   const rejectBooking = await request(hotelA.supabase, hotels[0], slots[4].starts_at);
   createdBookings.push(first.id, second.id, rejectBooking.id);
+  const queuedChannels=localSql(`select count(*) from wellweb_private.notification_outbox o join public.wellweb_notifications n on n.id=o.notification_id where n.booking_id='${first.id}'::uuid`);
+  assert.match(queuedChannels,/2/,'booking request event should enqueue email and WhatsApp independently');
+  const deadlineView=await pro.supabase.rpc('my_list_wellweb_bookings');
+  const firstWithDeadline=deadlineView.data.find(row=>row.id===first.id);
+  assert.ok(firstWithDeadline?.response_deadline_at);
+  assert.ok(Math.abs(Date.parse(firstWithDeadline.response_deadline_at)-Date.parse(firstWithDeadline.created_at)-4*60*60*1000)<5000,'new request deadline must be four hours after server creation');
+  assert.equal(firstWithDeadline.resolution_code,null);
   assert.equal(first.status, 'PENDING'); assert.match(first.reference, /^WW-/);
   assert.equal(Number(first.total_price), 25);
   pass('approved hotel creates PENDING request with reference and service snapshot');
+
+  const expirationBooking=await request(hotelA.supabase,hotels[0],slots[2].starts_at);
+  createdBookings.push(expirationBooking.id);
+  localSql(`update public.wellweb_bookings set response_deadline_at=now()-interval '1 second' where id='${expirationBooking.id}'::uuid`);
+  let expired;
+  for(let attempt=0;attempt<75;attempt++){
+    const rows=await pro.supabase.rpc('my_list_wellweb_bookings');expired=rows.data?.find(row=>row.id===expirationBooking.id);
+    if(expired?.resolution_code==='PROFESSIONAL_RESPONSE_TIMEOUT')break;
+    await pause(1000);
+  }
+  assert.equal(expired?.status,'CANCELLED','cron must expire a due pending request without frontend activity');
+  assert.equal(expired?.resolution_code,'PROFESSIONAL_RESPONSE_TIMEOUT');
+  await denied(pro.supabase,'decide_wellweb_booking',{p_booking_id:expirationBooking.id,p_accept:true,p_reason:null});
+  const expiredProNotices=await pro.supabase.from('wellweb_notifications').select('id').eq('booking_id',expirationBooking.id).eq('event_type','BOOKING_EXPIRED');
+  const expiredHotelNotices=await hotelA.supabase.from('wellweb_notifications').select('id').eq('booking_id',expirationBooking.id).eq('event_type','BOOKING_EXPIRED');
+  assert.ok((expiredProNotices.data?.length??0)>0);assert.ok((expiredHotelNotices.data?.length??0)>0);
+  const releasedSlots=await hotelA.supabase.rpc('wellweb_available_booking_slots',{p_professional_profile_id:profileId,p_service_id:serviceId,p_from:date,p_to:date});
+  assert.ok(releasedSlots.data?.some(slot=>Date.parse(slot.starts_at)===Date.parse(slots[2].starts_at)),'expired pending request must release its slot');
+  pass('background scheduler expires a due request, audits the timeout, notifies both parties, denies late response and releases the slot');
 
   const groupSlots = await hotelA.supabase.rpc('wellweb_available_booking_slots', { p_professional_profile_id: profileId, p_service_id: secondServiceId, p_from: date, p_to: date });
   assert.equal(groupSlots.error, null);
@@ -482,6 +529,15 @@ try {
   assert.ok((hotelNotifications.data ?? []).length > 0);
   assert.equal(isolatedNotifications.data?.length, 0);
   await ok(pro.supabase, 'mark_wellweb_notification_read', { p_notification_id: proNotifications.data[0].id });
+  const notificationId=proNotifications.data.find(item=>item.event_type==='BOOKING_REQUESTED')?.id;
+  assert.ok(notificationId);
+  const outboxIdOutput=localSql(`update wellweb_private.notification_outbox set status='PROCESSING',attempts=1,processing_started_at=now() where channel='WHATSAPP' and notification_id='${notificationId}'::uuid returning id`);
+  const candidateOutboxId=outboxIdOutput.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i)?.[0];assert.ok(candidateOutboxId);
+  const backend=createClient(endpoint,localServiceKey(),{auth:{persistSession:false,autoRefreshToken:false}});
+  const ineligibleWhatsApp=await backend.rpc('check_wellweb_whatsapp_eligibility',{p_outbox_id:candidateOutboxId});
+  assert.equal(ineligibleWhatsApp.error,null);assert.equal(ineligibleWhatsApp.data?.eligible,false);assert.equal(ineligibleWhatsApp.data?.reason,'WHATSAPP_DISABLED');
+  localSql(`update wellweb_private.notification_outbox set status='PENDING',attempts=0,processing_started_at=null where id='${candidateOutboxId}'::uuid`);
+  pass('notification event enqueues both channels and backend eligibility blocks WhatsApp after consent revocation');
   pass('notifications persist, remain private to recipients, and can be marked read');
 
   const all = await admin.supabase.rpc('admin_list_wellweb_bookings', { p_status: null, p_hotel_id: null, p_professional_profile_id: null, p_from: null, p_to: null });

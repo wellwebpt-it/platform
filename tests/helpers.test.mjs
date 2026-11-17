@@ -89,6 +89,18 @@ check('registration role is fixed to HOTEL or PROFESSIONAL and metadata contains
   assert.equal('ADMIN' in metadata, false);
 });
 
+check('registration normalizes international phone and keeps WhatsApp consent optional and versioned', () => {
+  const common = { displayName: 'Ana Silva', email: 'ana@example.pt', password: 'bem-estar-2026', passwordConfirmation: 'bem-estar-2026', phone: '+351 912-345-678', city: 'Ericeira', serviceArea: 'Yoga e movimento' };
+  assert.deepEqual(registration.validateRegistration(common, 'PROFESSIONAL'), {});
+  const optedOut = registration.registrationMetadata(common, 'PROFESSIONAL');
+  assert.equal(optedOut.phone_e164, '+351912345678');
+  assert.equal('whatsapp_operational_consent' in optedOut, false);
+  const optedIn = registration.registrationMetadata({ ...common, whatsappConsent: true }, 'PROFESSIONAL');
+  assert.equal(optedIn.whatsapp_operational_consent, true);
+  assert.equal(optedIn.whatsapp_consent_text_version, registration.WHATSAPP_CONSENT_TEXT_VERSION);
+  assert.match(registration.WHATSAPP_CONSENT_TEXT, /Posso desativar estas notificações a qualquer momento/);
+});
+
 check('invalid email, weak password, mismatched password and non-E.164 phone are rejected', () => {
   const errors = registration.validateRegistration({ displayName: 'A', email: 'bad', password: 'short', passwordConfirmation: 'different', phone: '912345678', city: '' }, 'PROFESSIONAL');
   assert.ok(errors.email);
